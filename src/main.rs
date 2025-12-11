@@ -1,23 +1,39 @@
+use std::cell::UnsafeCell;
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::thread::JoinHandle;
 
 fn main() {
-    let input_path = std::env::args()
+    let runner = std::env::args()
         .nth(1)
-        .expect("Usage: obrc-rust [input_file] [output_file]");
-    let output_path = std::env::args()
+        .expect("Usage: obrc-rust [runner] [input_file] [output_file]");
+    let input_path = std::env::args()
         .nth(2)
-        .expect("Usage: obrc-rust [input_file] [output_file]");
+        .expect("Usage: obrc-rust [runner] [input_file] [output_file]");
+    let output_path = std::env::args()
+        .nth(3)
+        .expect("Usage: obrc-rust [runner] [input_file] [output_file]");
     let brc_reader = BrcReader::new(input_path.into());
-    let tree = brc_reader.run_naive();
+
+    let tree = match runner.as_str() {
+        "naive" => brc_reader.run_naive(),
+        "partitioned" => brc_reader.run_partitioned(10),
+        _ => unimplemented!("{} is not implemented yet", runner),
+    };
+
     BrcReader::write_map(&tree, &PathBuf::from(output_path));
 }
 
 struct BrcReader {
     file_path: PathBuf,
+}
+
+struct BrcChanCtx {
+    partition_n: u8,
+    tree: UnsafeCell<BTreeMap<String, (f32, f32, f32, i32)>>,
 }
 
 impl BrcReader {
@@ -64,38 +80,96 @@ impl BrcReader {
         map
     }
 
-    pub fn run_partitioned(&self, partitions: u8) -> BTreeMap<String, (f32, f32, f32, i32)> {
+    pub fn run_partitioned(&self, partitions: u64) -> BTreeMap<String, (f32, f32, f32, i32)> {
+        let mut map: BTreeMap<String, (f32, f32, f32, i32)> = BTreeMap::new();
         let file = File::open(&self.file_path).unwrap();
         let metadata = file.metadata().unwrap();
         let file_size = metadata.len();
-    }
+        let approx_offset_n = file_size / partitions;
 
-    fn merge(
-        vec: Vec<BTreeMap<String, (f32, f32, f32, i32)>>,
-    ) -> BTreeMap<String, (f32, f32, f32, i32)> {
-        let mut map: BTreeMap<String, (f32, f32, f32, i32)> = BTreeMap::new();
+        let (rx, tx) = channel();
+        let mut handles = vec![];
 
-        for tree in vec {
-            for (key, value) in tree {}
+        for p in 0..partitions {
+            let handle = Self::spawn_worker(&self.file_path, p, approx_offset_n, rx.clone());
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
         }
 
         map
     }
 
-    fn spawn_worker(
-        buf_reader: &mut BufReader<File>,
-        partition_n: u8,
-    ) -> Arc<BTreeMap<String, (f32, f32, f32, i32)>> {
-        // TODO: Make BtreeMap and BufReader thread safe
-        //                             min  mean max count
-        let mut map: Arc<BTreeMap<String, (f32, f32, f32, i32)>> = Arc::new(BTreeMap::new());
-        let handler = std::thread::spawn(|| {
-            map.insert("a".to_string(), (0.0, 0.0, 0.0, 0));
-        });
-
-        handler.join().unwrap();
+    fn merge(
+        tree: UnsafeCell<BTreeMap<String, (f32, f32, f32, i32)>>,
+        reader_chan: Receiver<BrcChanCtx>,
+    ) -> BTreeMap<String, (f32, f32, f32, i32)> {
+        let mut map: BTreeMap<String, (f32, f32, f32, i32)> = BTreeMap::new();
 
         map
+    }
+
+    fn spawn_worker(
+        file_name: &PathBuf,
+        partition_n: u64,
+        approx_offset_n: u64,
+        writer_chan: Sender<BrcChanCtx>,
+    ) -> JoinHandle<()> {
+        //                             min  mean max count
+        let mut map: UnsafeCell<BTreeMap<String, (f32, f32, f32, i32)>> =
+            UnsafeCell::new(BTreeMap::new());
+        let file = File::open(file_name).unwrap();
+        let start = Self::get_line_start_offset(&file, approx_offset_n * partition_n)
+            .expect("start offset");
+        let end = Self::get_line_start_offset(&file, approx_offset_n * (partition_n + 1))
+            .expect("end offset");
+
+        let mut reader = BufReader::new(file.take(end - start));
+        reader.get_mut().seek(SeekFrom::Start(start)).unwrap();
+
+        std::thread::spawn(move || {
+            let mut_map = map.get_mut();
+            for val in reader.lines() {
+                let line = val.unwrap();
+                let v = line.split(';').collect::<Vec<&str>>();
+                let key = String::from(v[0]);
+                let value = String::from(v[1]).parse::<f32>().unwrap();
+
+                if let Some(val) = mut_map.get_mut(&key) {
+                    let new_count = (*val).3 + 1;
+
+                    // Check for min
+                    if (*val).0 > value {
+                        (*val).0 = value;
+                    }
+
+                    // Check for mean
+                    let new_mean = ((*val).1 * (*val).3 as f32 + value) / new_count as f32;
+                    (*val).1 = new_mean;
+                    (*val).3 = new_count;
+
+                    // Check for max
+                    if (*val).2 < value {
+                        (*val).2 = value;
+                    }
+                } else {
+                    mut_map.insert(key, (value, value, value, 1));
+                }
+            }
+        })
+    }
+
+    fn get_line_start_offset(reader: &File, approximate_offset: u64) -> std::io::Result<u64> {
+        let mut reader = BufReader::new(reader);
+        reader.seek(SeekFrom::Start(approximate_offset))?;
+        if approximate_offset > 0 {
+            let mut throwaway = String::new();
+            reader.read_line(&mut throwaway)?;
+        }
+
+        reader.stream_position()
     }
 
     pub fn write_map(map: &BTreeMap<String, (f32, f32, f32, i32)>, path: &PathBuf) {
