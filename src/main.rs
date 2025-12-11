@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 fn main() {
     let input_path = std::env::args()
@@ -38,33 +39,61 @@ impl BrcReader {
             let key = String::from(v[0]);
             let value = String::from(v[1]).parse::<f32>().unwrap();
 
-            if let Some(val) = map.get(&key) {
-                let mut v: (f32, f32, f32, i32) = (0.0, 0.0, 0.0, 0);
+            if let Some(val) = map.get_mut(&key) {
                 let new_count = (*val).3 + 1;
 
                 // Check for min
                 if (*val).0 > value {
-                    v.0 = value;
-                } else {
-                    v.0 = (*val).0;
+                    (*val).0 = value;
                 }
+
                 // Check for mean
                 let new_mean = ((*val).1 * (*val).3 as f32 + value) / new_count as f32;
-                v.1 = new_mean;
-                v.3 = new_count;
+                (*val).1 = new_mean;
+                (*val).3 = new_count;
 
                 // Check for max
                 if (*val).2 < value {
-                    v.2 = value;
-                } else {
-                    v.2 = (*val).2;
+                    (*val).2 = value;
                 }
-
-                map.insert(key, v);
             } else {
                 map.insert(key, (value, value, value, 1));
             }
         }
+
+        map
+    }
+
+    pub fn run_partitioned(&self, partitions: u8) -> BTreeMap<String, (f32, f32, f32, i32)> {
+        let file = File::open(&self.file_path).unwrap();
+        let metadata = file.metadata().unwrap();
+        let file_size = metadata.len();
+    }
+
+    fn merge(
+        vec: Vec<BTreeMap<String, (f32, f32, f32, i32)>>,
+    ) -> BTreeMap<String, (f32, f32, f32, i32)> {
+        let mut map: BTreeMap<String, (f32, f32, f32, i32)> = BTreeMap::new();
+
+        for tree in vec {
+            for (key, value) in tree {}
+        }
+
+        map
+    }
+
+    fn spawn_worker(
+        buf_reader: &mut BufReader<File>,
+        partition_n: u8,
+    ) -> Arc<BTreeMap<String, (f32, f32, f32, i32)>> {
+        // TODO: Make BtreeMap and BufReader thread safe
+        //                             min  mean max count
+        let mut map: Arc<BTreeMap<String, (f32, f32, f32, i32)>> = Arc::new(BTreeMap::new());
+        let handler = std::thread::spawn(|| {
+            map.insert("a".to_string(), (0.0, 0.0, 0.0, 0));
+        });
+
+        handler.join().unwrap();
 
         map
     }
